@@ -582,6 +582,26 @@ class CPUGraphRunner:
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = CaptureHiddenMode.NULL
         self.num_tokens_per_bs = 1
+        if not model_runner.spec_algorithm.is_none():
+            # Target-verify compile support: the target worker replays the
+            # verify forward (bs * draft_token_num tokens) through
+            # torch.compile. Draft runners never construct this runner
+            # (they pass capture_decode_cuda_graph=False).
+            assert (
+                not model_runner.is_draft_worker
+            ), "CPUGraphRunner does not support draft-worker capture yet."
+            assert (
+                model_runner.spec_algorithm.is_eagle()
+                or model_runner.spec_algorithm.is_standalone()
+                or model_runner.spec_algorithm.is_ngram()
+            ), (
+                "CPUGraphRunner only supports EAGLE/STANDALONE/NGRAM "
+                f"speculative algorithms, got {model_runner.spec_algorithm}."
+            )
+            self.capture_forward_mode = ForwardMode.TARGET_VERIFY
+            self.num_tokens_per_bs = (
+                model_runner.server_args.speculative_num_draft_tokens
+            )
 
         # If returning hidden states is enabled, set initial capture hidden mode to full to avoid double-capture on startup
         if self.enable_return_hidden_states:
@@ -602,9 +622,6 @@ class CPUGraphRunner:
         assert (
             not self.require_gathered_buffer
         ), "CPUGraphRunner does not support gathered buffer yet."
-        assert (
-            model_runner.spec_algorithm.is_none()
-        ), "CPUGraphRunner does not support speculative inference yet."
 
         assert self.dp_size == 1, "CPUGraphRunner does not support DP yet."
         assert self.pp_size == 1, "CPUGraphRunner does not support PP yet."
@@ -643,11 +660,19 @@ class CPUGraphRunner:
             self.positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
             self.mrope_positions = torch.zeros((3, self.max_bs), dtype=torch.int64)
             self.num_token_non_padded = torch.zeros((1,), dtype=torch.int64)
+            if self.model_runner.spec_algorithm.is_none():
+                custom_mask_len = (
+                    self.seq_lens.sum().item() + self.max_num_token
+                ) * self.num_tokens_per_bs
+            else:
+                # Speculative verify tree mask. extend_attention_cpu requires
+                # exactly bs * draft_token_num^2 elements (the CPU tree mask
+                # covers draft tokens only; the committed prefix is implicitly
+                # visible), so the mask shape is static per batch size and
+                # capture slices this buffer to bs * draft_token_num^2.
+                custom_mask_len = self.max_num_token * self.num_tokens_per_bs
             self.custom_mask = torch.ones(
-                (
-                    (self.seq_lens.sum().item() + self.max_num_token)
-                    * self.num_tokens_per_bs
-                ),
+                (custom_mask_len,),
                 dtype=torch.bool,
                 device=self.device,
             )
@@ -687,6 +712,11 @@ class CPUGraphRunner:
         return bool(forward_batch.encoder_lens.max() == 0)
 
     def can_run_graph(self, forward_batch: ForwardBatch):
+        # Captured graphs are mode-specific: DECODE without speculative
+        # decoding, TARGET_VERIFY with it.
+        if forward_batch.forward_mode != self.capture_forward_mode:
+            return False
+
         is_bs_supported = (
             forward_batch.batch_size in self.graphs
             if self.disable_padding
@@ -868,9 +898,16 @@ class CPUGraphRunner:
         capture_hidden_mode_required_by_forward_batch = (
             forward_batch.capture_hidden_mode
         )
-        capture_hidden_mode_required_by_spec_info = getattr(
-            forward_batch.spec_info, "capture_hidden_mode", CaptureHiddenMode.NULL
-        )
+        # Runtime verify inputs may carry capture_hidden_mode=None ("no
+        # preference"); coalesce to NULL so the max() below stays enum-only.
+        capture_hidden_mode_required_by_spec_info = CaptureHiddenMode.NULL
+        if (
+            forward_batch.spec_info is not None
+            and forward_batch.spec_info.capture_hidden_mode is not None
+        ):
+            capture_hidden_mode_required_by_spec_info = (
+                forward_batch.spec_info.capture_hidden_mode
+            )
         capture_hidden_mode_required_for_returning_hidden_states = (
             CaptureHiddenMode.FULL
             if self.enable_return_hidden_states
@@ -891,6 +928,45 @@ class CPUGraphRunner:
             self.capture_hidden_mode = required_capture_hidden_mode
             self.capture()
 
+    def _copy_spec_mask_for_padding(self, forward_batch: ForwardBatch):
+        """Bring a live tree mask into the capture buffer for a padded verify
+        replay (the replay runs with the captured spec_info, whose custom_mask
+        is a bs*draft_token_num^2 slice of self.custom_mask).
+
+        The live mask (raw_bs rows) lands in the buffer prefix; padded rows
+        keep the buffer's all-ones fill, which is safe because their outputs
+        are sliced away. tree_topk == 1 chains carry no mask at all (the
+        backend uses its built-in causal path).
+        """
+        if not forward_batch.forward_mode.is_target_verify():
+            return
+        from sglang.srt.speculative.eagle_info import EagleVerifyInput
+        from sglang.srt.speculative.ngram_info import NgramVerifyInput
+
+        spec_info = forward_batch.spec_info
+        if not isinstance(spec_info, (EagleVerifyInput, NgramVerifyInput)):
+            return
+        if spec_info.tree_topk == 1:
+            return
+        mask = spec_info.custom_mask
+        if mask is None or mask.numel() == 0:
+            return
+        assert mask.numel() <= self.custom_mask.numel(), (
+            f"tree mask ({mask.numel()}) exceeds the capture buffer "
+            f"({self.custom_mask.numel()})."
+        )
+        self.custom_mask[: mask.numel()].copy_(mask)
+
+    def load_batch(
+        self,
+        forward_batch: ForwardBatch,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ):
+        """Pre-plan attention metadata for an exact-batch-size replay (CPU
+        analogue of the CUDA plan-stream load_batch). The caller marks the
+        batch's forward metadata ready; prepare_replay then skips re-init."""
+        self.model_runner.attn_backend.init_forward_metadata(forward_batch)
+
     def prepare_replay(
         self,
         forward_batch: ForwardBatch,
@@ -907,13 +983,19 @@ class CPUGraphRunner:
 
         raw_bs = forward_batch.batch_size
         if raw_bs in graphs:
+            # Callers (e.g. verify plan-stream paths) may read these on any
+            # replay; keep them coherent for exact-batch-size hits too.
+            self.raw_bs = raw_bs
+            self.raw_num_token = raw_bs * self.num_tokens_per_bs
+            self.bs = raw_bs
             # Keep encoder_out_cache_loc consistent with the captured graph (None).
             if self.is_encoder_decoder:
                 # encoder_out_cache_loc is never accessed during decode (k/v are
                 # None so the KV-write path is skipped in the kernel).  Use None
                 # consistently at both capture time and runtime.
                 forward_batch.encoder_out_cache_loc = None
-            self.model_runner.attn_backend.init_forward_metadata(forward_batch)
+            if forward_batch.needs_forward_metadata_init():
+                self.model_runner.attn_backend.init_forward_metadata(forward_batch)
             return forward_batch
 
         raw_num_token = raw_bs * self.num_tokens_per_bs
@@ -923,6 +1005,8 @@ class CPUGraphRunner:
         self.raw_bs = raw_bs
         self.raw_num_token = raw_num_token
         self.bs = bs
+
+        self._copy_spec_mask_for_padding(forward_batch)
 
         captured_forward_batch = cfbs[bs]
         assert captured_forward_batch is not None
@@ -1000,6 +1084,11 @@ class CPUGraphRunner:
 
     def get_spec_info(self, num_tokens: int):
         spec_info = None
+        # extend_attention_cpu requires the tree mask to hold exactly
+        # bs * draft_token_num^2 elements (= num_tokens * num_tokens_per_bs).
+        capture_custom_mask = self.custom_mask[
+            : num_tokens * self.num_tokens_per_bs
+        ]
         if (
             self.model_runner.spec_algorithm.is_eagle()
             or self.model_runner.spec_algorithm.is_standalone()
@@ -1009,9 +1098,16 @@ class CPUGraphRunner:
             if self.model_runner.is_draft_worker:
                 raise RuntimeError("This should not happen.")
             else:
+                # Mirror eagle_prepare_for_verify: STANDALONE skips hidden
+                # states end-to-end, EAGLE-family verify captures FULL.
+                capture_mode = (
+                    CaptureHiddenMode.NULL
+                    if self.model_runner.spec_algorithm.is_standalone()
+                    else CaptureHiddenMode.FULL
+                )
                 spec_info = EagleVerifyInput(
                     draft_token=None,
-                    custom_mask=self.custom_mask,
+                    custom_mask=capture_custom_mask,
                     positions=None,
                     retrieve_index=None,
                     retrieve_next_token=None,
@@ -1020,10 +1116,29 @@ class CPUGraphRunner:
                     spec_steps=self.model_runner.server_args.speculative_num_steps,
                     topk=self.model_runner.server_args.speculative_eagle_topk,
                     draft_token_num=self.model_runner.server_args.speculative_num_draft_tokens,
-                    capture_hidden_mode=CaptureHiddenMode.FULL,
+                    capture_hidden_mode=capture_mode,
                     seq_lens_sum=None,
                     seq_lens_cpu=None,
                 )
+                # MTP models (e.g. deepseek_nextn) read spec_info.hidden_states
+                spec_info.hidden_states = torch.zeros(
+                    (num_tokens, self.model_runner.model_config.hidden_size),
+                    dtype=self.model_runner.dtype,
+                    device=self.model_runner.device,
+                )
+        elif self.model_runner.spec_algorithm.is_ngram():
+            from sglang.srt.speculative.ngram_info import NgramVerifyInput
+
+            spec_info = NgramVerifyInput(
+                draft_token=None,
+                custom_mask=capture_custom_mask,
+                positions=None,
+                retrieve_index=None,
+                retrieve_next_token=None,
+                retrieve_next_sibling=None,
+                draft_token_num=self.num_tokens_per_bs,
+            )
+            spec_info.capture_hidden_mode = CaptureHiddenMode.NULL
 
         return spec_info
 

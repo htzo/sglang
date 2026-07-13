@@ -75,45 +75,53 @@ class IntelAMXAttnBackend(AttentionBackend):
         tree_mask = None
 
         if forward_batch.forward_mode.is_target_verify():
-            spec_info = forward_batch.spec_info
-            if spec_info is None:
-                raise RuntimeError(
-                    "spec_info is unset in TARGET_VERIFY mode; the extend_* "
-                    "metadata can only be derived from spec_info for "
-                    "speculative verify batches."
-                )
-            num_draft_tokens = spec_info.draft_token_num
-            extend_seq_lens = torch.full(
-                (bs,), num_draft_tokens, dtype=torch.int32, device=self.device
+            return self._build_verify_extend_metadata(
+                bs=bs, seq_lens=seq_lens, spec_info=forward_batch.spec_info
             )
-            # Uniform extend lengths: start locations form a plain range.
-            extend_start_loc = torch.arange(
-                0,
-                bs * num_draft_tokens,
-                num_draft_tokens,
-                dtype=torch.int32,
-                device=self.device,
-            )
-            seq_lens = forward_batch.seq_lens + num_draft_tokens
-            # Speculative verify with a token tree: each draft token may only
-            # attend to its ancestors among the draft tokens (the committed
-            # prefix stays fully visible).
-            #
-            # NOTE: unlike triton_backend.py, which forwards spec_info.custom_mask
-            # unconditionally, the mask is gated on tree_topk here. tree_topk == 1
-            # means the draft tokens form a simple chain whose visibility is
-            # exactly the kernel's built-in causal masking, and skipping the explicit
-            # mask lets extend_attention_cpu take its faster mask-free path. EAGLE
-            # has tree_topk == topk (> 1 for real trees); NGRAM has tree_topk == -1
-            # (irregular tree); both need the mask.
-            if spec_info.tree_topk != 1:
-                custom_mask = spec_info.custom_mask
-                if custom_mask is not None and custom_mask.numel() > 0:
-                    tree_mask = custom_mask
-        else:
-            extend_seq_lens = forward_batch.extend_seq_lens
-            extend_start_loc = forward_batch.extend_start_loc
 
+        extend_seq_lens = forward_batch.extend_seq_lens
+        extend_start_loc = forward_batch.extend_start_loc
+
+        return seq_lens, extend_seq_lens, extend_start_loc, tree_mask
+
+    def _build_verify_extend_metadata(self, bs, seq_lens, spec_info):
+        """TARGET_VERIFY extend metadata, shared by the eager path and CPU
+        graph capture (which has no ForwardBatch)."""
+        if spec_info is None:
+            raise RuntimeError(
+                "spec_info is unset in TARGET_VERIFY mode; the extend_* "
+                "metadata can only be derived from spec_info for "
+                "speculative verify batches."
+            )
+        tree_mask = None
+        num_draft_tokens = spec_info.draft_token_num
+        extend_seq_lens = torch.full(
+            (bs,), num_draft_tokens, dtype=torch.int32, device=self.device
+        )
+        # Uniform extend lengths: start locations form a plain range.
+        extend_start_loc = torch.arange(
+            0,
+            bs * num_draft_tokens,
+            num_draft_tokens,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        seq_lens = seq_lens + num_draft_tokens
+        # Speculative verify with a token tree: each draft token may only
+        # attend to its ancestors among the draft tokens (the committed
+        # prefix stays fully visible).
+        #
+        # NOTE: unlike triton_backend.py, which forwards spec_info.custom_mask
+        # unconditionally, the mask is gated on tree_topk here. tree_topk == 1
+        # means the draft tokens form a simple chain whose visibility is
+        # exactly the kernel's built-in causal masking, and skipping the explicit
+        # mask lets extend_attention_cpu take its faster mask-free path. EAGLE
+        # has tree_topk == topk (> 1 for real trees); NGRAM has tree_topk == -1
+        # (irregular tree); both need the mask.
+        if spec_info.tree_topk != 1:
+            custom_mask = spec_info.custom_mask
+            if custom_mask is not None and custom_mask.numel() > 0:
+                tree_mask = custom_mask
         return seq_lens, extend_seq_lens, extend_start_loc, tree_mask
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -173,9 +181,18 @@ class IntelAMXAttnBackend(AttentionBackend):
             dtype=torch.float32,
             device=self.device,
         )
-        max_extend_len = None
+        if forward_mode.is_target_verify():
+            # Speculative verify capture: same extend metadata the eager path
+            # derives in init_forward_metadata, built from the capture-time
+            # spec_info (whose custom_mask is the runner's fixed-size buffer).
+            max_extend_len = self.num_draft_tokens
+            self.extend_metadata = self._build_verify_extend_metadata(
+                bs=bs, seq_lens=seq_lens, spec_info=spec_info
+            )
+        else:
+            max_extend_len = None
+            self.extend_metadata = None
         self.forward_metadata = (attn_logits, max_extend_len)
-        self.extend_metadata = None
 
     def init_cpu_graph_state(self, max_bs: int, max_num_tokens: int):
         pass

@@ -34,6 +34,9 @@ class NgramVerifyInput(SpecInput):
         self.retrieve_next_sibling = retrieve_next_sibling
         self.draft_token_num = draft_token_num
         self.grammar = grammar
+        # Graph runners key their capture on this; None means "no preference"
+        # (coalesced to CaptureHiddenMode.NULL by the runners).
+        self.capture_hidden_mode = None
 
         # Inputs for V2 overlap worker
         self.future_indices = future_indices
