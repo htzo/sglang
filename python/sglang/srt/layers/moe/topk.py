@@ -704,13 +704,16 @@ def fused_topk_cpu(
     renormalize: bool,
     correction_bias: torch.Tensor = None,
     scoring_func: str = "softmax",
+    routed_scaling_factor: Optional[float] = None,
+    apply_routed_scaling_factor_on_output: Optional[bool] = False,
+    num_fused_shared_experts: int = 0,
 ):
     # TODO: add c++ kernel for cpu
     # The topk_softmax_cpu kernel only handles vanilla softmax scoring with no
     # correction bias. Fall back to the torch-native impl for the rest
     # (e.g. MiniMax sets both correction_bias and scoring_func).
     if correction_bias is not None or scoring_func != "softmax":
-        return fused_topk_torch_native(
+        topk_weights, topk_ids = fused_topk_torch_native(
             hidden_states,
             gating_output,
             topk,
@@ -718,7 +721,23 @@ def fused_topk_cpu(
             correction_bias=correction_bias,
             scoring_func=scoring_func,
         )
+        # Mirror the CUDA fused_topk sigmoid branch (topk_sigmoid): the
+        # routed scaling is applied after renormalization; the torch-native
+        # fallback has no fused-shared-experts support.
+        if scoring_func == "sigmoid":
+            if num_fused_shared_experts != 0:
+                raise NotImplementedError(
+                    "fused_topk_cpu does not support fused shared experts."
+                )
+            if (
+                apply_routed_scaling_factor_on_output
+                and routed_scaling_factor is not None
+            ):
+                topk_weights = topk_weights * routed_scaling_factor
+        return topk_weights, topk_ids
 
+    # Like the CUDA fused_topk softmax branch, num_fused_shared_experts /
+    # routed_scaling_factor are not consumed on this path.
     topk_weights, topk_ids = torch.ops.sgl_kernel.topk_softmax_cpu(
         hidden_states=hidden_states,
         gating_output=gating_output,

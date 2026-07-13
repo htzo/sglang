@@ -7,6 +7,9 @@ from sglang.srt.layers.moe.topk import (
     biased_grouped_topk_impl as native_biased_grouped_topk,
 )
 from sglang.srt.layers.moe.topk import biased_topk_impl as native_biased_topk
+from sglang.srt.layers.moe.topk import (
+    fused_topk_cpu,
+)
 from sglang.srt.layers.moe.topk import fused_topk_torch_native as native_fused_topk
 from sglang.srt.layers.moe.topk import grouped_topk_gpu as native_grouped_topk
 from sglang.srt.models.llama4 import Llama4MoE
@@ -249,6 +252,96 @@ class TestCustomTopK(CustomTestCase):
             )
             self._run_single_test(
                 123, 32, 1, False, torch.bfloat16, native_custom_f, fused_custom_f
+            )
+
+
+class TestFusedTopKSelectExpertsCompat(CustomTestCase):
+    """Bug regression: #28715 made the shared select_experts call site pass
+    num_fused_shared_experts / routed_scaling_factor /
+    apply_routed_scaling_factor_on_output to fused_topk unconditionally.
+    fused_topk_cpu (the CPU rebinding of fused_topk) did not accept them, so
+    every MoE model on the default fused_topk path (e.g. Qwen3MOE, Qwen3-Next)
+    raised a TypeError at the first MoE gate on CPU.
+    """
+
+    # The exact keyword set the select_experts default branch passes.
+    SELECT_EXPERTS_KWARGS = dict(
+        correction_bias=None,
+        scoring_func="softmax",
+        num_fused_shared_experts=0,
+        routed_scaling_factor=None,
+        apply_routed_scaling_factor_on_output=False,
+    )
+
+    M, E, TOPK = 64, 32, 4
+
+    def _gating_inputs(self, dtype=torch.bfloat16):
+        torch.manual_seed(33)
+        hidden_states = torch.randn(self.M, 100, dtype=dtype)
+        gating_output = torch.randn(self.M, self.E, dtype=dtype) * 2 * self.M
+        return hidden_states, gating_output
+
+    def test_softmax_accepts_select_experts_kwargs(self):
+        hidden_states, gating_output = self._gating_inputs()
+
+        topk_weights, topk_ids = fused_topk_cpu(
+            hidden_states, gating_output, self.TOPK, True, **self.SELECT_EXPERTS_KWARGS
+        )
+        ref_topk_weights, ref_topk_ids = torch.ops.sgl_kernel.topk_softmax_cpu(
+            hidden_states, gating_output, self.TOPK, True
+        )
+
+        torch.testing.assert_close(topk_weights, ref_topk_weights)
+        torch.testing.assert_close(topk_ids, ref_topk_ids)
+
+    def test_sigmoid_routed_scaling_applied_on_output(self):
+        # Like the CUDA fused_topk sigmoid branch (topk_sigmoid), the routed
+        # scaling factor multiplies the final (post-renormalization) weights,
+        # and only when apply_routed_scaling_factor_on_output is set.
+        hidden_states, gating_output = self._gating_inputs(dtype=torch.float32)
+        kwargs = {
+            **self.SELECT_EXPERTS_KWARGS,
+            "scoring_func": "sigmoid",
+            "routed_scaling_factor": 2.5,
+        }
+
+        ref_topk_weights, ref_topk_ids = native_fused_topk(
+            hidden_states, gating_output, self.TOPK, True, scoring_func="sigmoid"
+        )
+
+        for apply_on_output in [True, False]:
+            with self.subTest(apply_on_output=apply_on_output):
+                topk_weights, topk_ids = fused_topk_cpu(
+                    hidden_states,
+                    gating_output,
+                    self.TOPK,
+                    True,
+                    **{
+                        **kwargs,
+                        "apply_routed_scaling_factor_on_output": apply_on_output,
+                    },
+                )
+                expected = (
+                    ref_topk_weights * 2.5 if apply_on_output else ref_topk_weights
+                )
+                torch.testing.assert_close(topk_weights, expected)
+                torch.testing.assert_close(topk_ids, ref_topk_ids)
+
+    def test_sigmoid_rejects_fused_shared_experts(self):
+        # The torch-native sigmoid fallback has no fused-shared-experts
+        # support; silently ignoring them would mis-route tokens.
+        hidden_states, gating_output = self._gating_inputs()
+        with self.assertRaises(NotImplementedError):
+            fused_topk_cpu(
+                hidden_states,
+                gating_output,
+                self.TOPK,
+                True,
+                **{
+                    **self.SELECT_EXPERTS_KWARGS,
+                    "scoring_func": "sigmoid",
+                    "num_fused_shared_experts": 1,
+                },
             )
 
 
