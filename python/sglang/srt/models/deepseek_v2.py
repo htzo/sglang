@@ -187,6 +187,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_server_args,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     BumpAllocator,
@@ -2895,8 +2896,8 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        current_platform.empty_cache()
+        current_platform.synchronize()
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
